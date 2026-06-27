@@ -6,7 +6,6 @@ const BLE_SERVICE_UUID = '0000ffe0-0000-1000-8000-00805f9b34fb';
 const BLE_TX_UUID = '0000ffe1-0000-1000-8000-00805f9b34fb'; // Notify (ESP32→手机)
 const BLE_RX_UUID = '0000ffe2-0000-1000-8000-00805f9b34fb'; // Write  (手机→ESP32)
 
-// 自定义协议常量
 const MSG_STROKE_DATA = 0x01;
 const MSG_PROJECTION_START = 0x02;
 const MSG_PROJECTION_STOP = 0x03;
@@ -16,23 +15,20 @@ const MSG_NACK = 0x06;
 
 let bleDevice = null;
 let bleServer = null;
-let rxCharacteristic = null; // 手机写→ESP32
-let txCharacteristic = null; // ESP32 Notify→手机
+let rxCharacteristic = null; // Write: 手机→ESP32
+let txCharacteristic = null; // Notify: ESP32→手机
 let isConnected = false;
-let mtu = 20; // 默认 MTU，连接后协商
+let mtu = 20;
 
-// 检查浏览器支持
 export function isWebBluetoothSupported() {
   return !!(navigator && navigator.bluetooth);
 }
 
-// 检查是否为 iOS (Safari 不支持)
 export function isIOS() {
   return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
     (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 }
 
-// 连接设备
 export async function connect() {
   try {
     bleDevice = await navigator.bluetooth.requestDevice({
@@ -48,16 +44,10 @@ export async function connect() {
     txCharacteristic = await service.getCharacteristic(BLE_TX_UUID);
     rxCharacteristic = await service.getCharacteristic(BLE_RX_UUID);
 
-    // 订阅 ESP32 通知
     await txCharacteristic.startNotifications();
     txCharacteristic.addEventListener('characteristicvaluechanged', handleNotification);
 
-    // 尝试协商 MTU (Android)
-    if (bleDevice.gatt && typeof bleDevice.gatt.mtu === 'number') {
-      mtu = bleDevice.gatt.mtu;
-    }
-    // iOS 通常自动协商到 185+
-    mtu = Math.min(mtu, 220);
+    mtu = Math.min(bleDevice.gatt?.mtu || 185, 220);
 
     isConnected = true;
     return { success: true, mtu };
@@ -67,7 +57,6 @@ export async function connect() {
   }
 }
 
-// 断开连接
 export async function disconnect() {
   if (bleDevice && bleDevice.gatt.connected) {
     await bleDevice.gatt.disconnect();
@@ -81,13 +70,11 @@ export async function disconnect() {
 
 function onDisconnect() {
   isConnected = false;
-  // 触发自定义事件，让 app.js 处理 UI 更新
   window.dispatchEvent(new CustomEvent('ble-disconnect'));
 }
 
 function handleNotification(event) {
   const data = new Uint8Array(event.target.value.buffer);
-  // ESP32 发来的确认 / 状态
   if (data[0] === MSG_ACK || data[0] === MSG_NACK) {
     window.dispatchEvent(new CustomEvent('ble-ack', {
       detail: { type: data[0], seq: data[1] }
@@ -95,90 +82,109 @@ function handleNotification(event) {
   }
 }
 
-// 发送笔画数据 (分包)
+// ---- 发送命令 (带 CRC) ----
+
+function buildCommand(type) {
+  // 帧: [0xAA|0x55|type|0|0|0|0|CRC8]
+  const frame = new Uint8Array(8);
+  frame[0] = 0xAA;
+  frame[1] = 0x55;
+  frame[2] = type;
+  // CRC 计算范围: [type, 0, 0, 0, 0] — 5 字节
+  const hdr = frame.subarray(2, 7);
+  frame[7] = crc8(hdr);
+  return frame;
+}
+
+export async function sendProjectionStart() {
+  if (!isConnected || !rxCharacteristic) throw new Error('设备未连接');
+  await rxCharacteristic.writeValueWithoutResponse(buildCommand(MSG_PROJECTION_START));
+}
+
+export async function sendProjectionStop() {
+  if (!isConnected || !rxCharacteristic) throw new Error('设备未连接');
+  await rxCharacteristic.writeValueWithoutResponse(buildCommand(MSG_PROJECTION_STOP));
+}
+
+// ---- 发送笔画数据 ----
+
 export async function sendStrokes(strokes) {
-  if (!isConnected || !rxCharacteristic) {
-    throw new Error('设备未连接');
-  }
+  if (!isConnected || !rxCharacteristic) throw new Error('设备未连接');
 
-  // 将笔画序列化为二进制
   const payload = serializeStrokes(strokes);
-  const effectiveSize = mtu - 8; // 减去帧头(8B)
-  const packets = splitPackets(payload, effectiveSize, MSG_STROKE_DATA);
-  const totalPackets = packets.length;
+  const effectiveSize = mtu - 8; // 8 字节帧头
+  const totalPackets = Math.ceil(payload.length / effectiveSize);
 
-  for (let seq = 0; seq < totalPackets; seq++) {
-    const packet = packets[seq];
-    // 帧头 + 包数据
-    const frame = new Uint8Array(packet.length + 8);
+  for (let i = 0; i < totalPackets; i++) {
+    const start = i * effectiveSize;
+    const end = Math.min(start + effectiveSize, payload.length);
+    const chunk = payload.subarray(start, end);
+    const seq = i + 1; // 1-based
+
+    const frame = new Uint8Array(chunk.length + 8);
     frame[0] = 0xAA;
     frame[1] = 0x55;
     frame[2] = MSG_STROKE_DATA;
-    frame[3] = 0;            // stroke index (跨包通用)
-    frame[4] = totalPackets;  // 总包数
-    frame[5] = seq + 1;       // 当前包序号 (1-based)
-    frame[6] = packet.length & 0xFF;  // 有效载荷长度
-    frame[7] = crc8(packet);
-    frame.set(packet, 8);
+    frame[3] = 0;                 // stroke index (保留)
+    frame[4] = totalPackets;
+    frame[5] = seq;
+    frame[6] = chunk.length & 0xFF;
+    frame.set(chunk, 8);
+
+    // CRC 计算: [type(1)+stroke(1)+total(1)+seq(1)+payloadLen(1)] + payload
+    const crcData = new Uint8Array(5 + chunk.length);
+    crcData.set(frame.subarray(2, 7));  // header bytes 2-6
+    crcData.set(chunk, 5);
+    frame[7] = crc8(crcData);
 
     await rxCharacteristic.writeValueWithoutResponse(frame);
-    // 少量延迟防止蓝牙栈拥塞
-    if (seq % 4 === 3) {
-      await sleep(10);
+
+    if (seq % 4 === 0) {
+      await sleep(12);
     }
   }
 }
 
-// 发送投影开始指令
-export async function sendProjectionStart() {
-  if (!isConnected || !rxCharacteristic) throw new Error('设备未连接');
-  const cmd = new Uint8Array([0xAA, 0x55, MSG_PROJECTION_START, 0, 0, 0, 0, 0]);
-  cmd[7] = crc8(cmd.subarray(0, 7));
-  await rxCharacteristic.writeValueWithoutResponse(cmd);
-}
+// ---- 序列化 ----
 
-// 发送投影停止指令
-export async function sendProjectionStop() {
-  if (!isConnected || !rxCharacteristic) throw new Error('设备未连接');
-  const cmd = new Uint8Array([0xAA, 0x55, MSG_PROJECTION_STOP, 0, 0, 0, 0, 0]);
-  cmd[7] = crc8(cmd.subarray(0, 7));
-  await rxCharacteristic.writeValueWithoutResponse(cmd);
-}
-
-// 笔画序列化: 每笔 → [颜色1B][粗细1B][点数2B][点序列...]
 function serializeStrokes(strokes) {
+  // 每笔: [color(1B)|weight(1B)|stroke_index(2B)|pointCount(2B)|points(N×5B)]
   const buffers = [];
   let totalSize = 0;
 
-  for (const stroke of strokes) {
-    const color = parseColor(stroke.color);
-    const weight = Math.round(stroke.weight * 10); // 0.5mm → 5
-    const points = stroke.points || stroke.segments?.map(s => ({
-      x: s.point?.x ?? s.x,
-      y: s.point?.y ?? s.y,
-      t: s.time ?? s.t ?? 0
-    })) || [];
+  for (let i = 0; i < strokes.length; i++) {
+    const st = strokes[i];
+    const colorCode = parseColor(st.color);
+    const weight10 = Math.min(255, Math.max(1, Math.round((st.weight || 2) * 10)));
 
-    const headerSize = 4; // color(1) + weight(1) + pointCount(2)
-    const buf = new ArrayBuffer(headerSize + points.length * 5);
+    const segs = st.points || st.segments || [];
+    const pts = segs.map(s => {
+      const pt = s.point || s;
+      return { x: pt.x ?? s.x ?? 0, y: pt.y ?? s.y ?? 0, t: pt.t ?? s.time ?? s.t ?? 0 };
+    }).filter(p => p.x !== undefined && p.y !== undefined);
+
+    if (pts.length < 2) continue; // 跳过无效笔画
+
+    const headerSize = 6;  // color(1)+weight(1)+stroke_index(2)+pointCount(2)
+    const buf = new ArrayBuffer(headerSize + pts.length * 5);
     const view = new DataView(buf);
 
-    view.setUint8(0, color);
-    view.setUint8(1, Math.min(255, Math.max(0, weight)));
-    view.setUint16(2, points.length, true);
+    view.setUint8(0, colorCode);
+    view.setUint8(1, weight10);
+    view.setUint16(2, i, true);          // stroke_index
+    view.setUint16(4, pts.length, true);  // pointCount
 
-    for (let i = 0; i < points.length; i++) {
-      const off = headerSize + i * 5;
-      view.setUint16(off, Math.round(points[i].x), true);
-      view.setUint16(off + 2, Math.round(points[i].y), true);
-      view.setUint8(off + 4, Math.min(255, Math.round((points[i].t || 0) / 10)));
+    for (let j = 0; j < pts.length; j++) {
+      const off = headerSize + j * 5;
+      view.setUint16(off,     Math.min(65535, Math.round(pts[j].x)), true);
+      view.setUint16(off + 2, Math.min(65535, Math.round(pts[j].y)), true);
+      view.setUint8(off + 4,  Math.min(255,   Math.round((pts[j].t || 0) / 10)));
     }
 
     buffers.push(new Uint8Array(buf));
     totalSize += buf.byteLength;
   }
 
-  // 合并所有笔画
   const result = new Uint8Array(totalSize);
   let offset = 0;
   for (const b of buffers) {
@@ -188,35 +194,29 @@ function serializeStrokes(strokes) {
   return result;
 }
 
-function parseColor(colorStr) {
-  // 简单颜色映射
-  const map = {
-    '#ff2020': 0x01,  // 红
-    '#20ff20': 0x02,  // 绿
-  };
-  if (map[colorStr]) return map[colorStr];
-  if (colorStr.includes('ff2020') && colorStr.includes('20ff20')) return 0x03; // 双色
-  return 0x01; // 默认红
+function parseColor(c) {
+  if (typeof c === 'number') return c;
+  if (typeof c === 'string') {
+    if (c.includes('#ff2020') || c.includes('ff2020') && c.includes('#20ff20') || c.includes('20ff20')) return 0x03;
+    if (c.includes('20') && c.includes('ff') && c.includes('20ff20')) return 0x03;
+  }
+  // 从笔画对象读取 color code
+  // 默认返回红色
+  const s = String(c || '');
+  if (s.includes('20ff20') || s.includes('#20ff20')) return 0x02; // green
+  if (s.includes('ff2020') || s.includes('#ff2020') || s.includes('red')) return 0x01; // red
+  if (s.includes('ff2020') && s.includes('20ff20')) return 0x03; // dual
+  return 0x01;
 }
 
-function splitPackets(data, chunkSize, type) {
-  const packets = [];
-  let offset = 0;
-  while (offset < data.length) {
-    const end = Math.min(offset + chunkSize, data.length);
-    packets.push(data.subarray(offset, end));
-    offset = end;
-  }
-  return packets;
-}
+// ---- CRC8 (与 ESP32 完全一致: poly=0x07, init=0x00) ----
 
 function crc8(data) {
   let crc = 0x00;
-  const poly = 0x07;
   for (let i = 0; i < data.length; i++) {
     crc ^= data[i];
     for (let j = 0; j < 8; j++) {
-      crc = (crc & 0x80) ? ((crc << 1) ^ poly) : (crc << 1);
+      crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) : (crc << 1);
       crc &= 0xFF;
     }
   }
@@ -224,7 +224,7 @@ function crc8(data) {
 }
 
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(r => setTimeout(r, ms));
 }
 
 export function getConnectionState() {

@@ -303,9 +303,9 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
     uint8_t payloadLen = data[6];
     uint8_t expectedCRC = data[7];
 
-    // CRC 校验
+    // CRC 校验: 与 JS 端一致, 计算 [type(1)+stroke_idx(1)+total(1)+seq(1)+payloadLen(1)] + payload
     uint8_t calcCRC = crc8(data + 2, 5);
-    calcCRC = crc8Update(calcCRC, data + 8, payloadLen);
+    calcCRC = crc8_update(calcCRC, data + 8, payloadLen);
     if (calcCRC != expectedCRC) {
       Serial.printf("BLE: CRC mismatch seq=%d\n", seq);
       sendNACK(seq);
@@ -380,7 +380,7 @@ uint8_t crc8(const uint8_t* data, size_t len) {
   return crc;
 }
 
-uint8_t crc8Update(uint8_t crc, const uint8_t* data, size_t len) {
+uint8_t crc8_update(uint8_t crc, const uint8_t* data, size_t len) {
   for (size_t i = 0; i < len; i++) {
     crc ^= data[i];
     for (int j = 0; j < 8; j++) {
@@ -400,9 +400,9 @@ void parseStrokes() {
   uint16_t strokeCount = 0;
   // 第一遍: 统计笔画数
   size_t tempOff = 0;
-  while (tempOff + 4 <= rxOffset) {
-    uint16_t ptCount = rxBuffer[tempOff + 2] | (rxBuffer[tempOff + 3] << 8);
-    size_t strokeSize = 4 + ptCount * 5;
+  while (tempOff + 6 <= rxOffset) {   // header = 6B: color+weight+stroke_idx(2)+ptCount(2)
+    uint16_t ptCount = rxBuffer[tempOff + 4] | (rxBuffer[tempOff + 5] << 8);
+    size_t strokeSize = 6 + ptCount * 5;
     if (tempOff + strokeSize > rxOffset) break;
     strokeCount++;
     tempOff += strokeSize;
@@ -421,20 +421,21 @@ void parseStrokes() {
     Stroke& s = g_project.strokes[i];
     s.color = rxBuffer[offset];
     s.weight = rxBuffer[offset + 1];
-    s.pointCount = rxBuffer[offset + 2] | (rxBuffer[offset + 3] << 8);
+    // offset+2,+3 = stroke_index (不需要存储)
+    s.pointCount = rxBuffer[offset + 4] | (rxBuffer[offset + 5] << 8);
 
     if (s.pointCount > MAX_POINTS_PER_STROKE) {
       s.pointCount = MAX_POINTS_PER_STROKE;
     }
 
     for (uint16_t j = 0; j < s.pointCount; j++) {
-      size_t poff = offset + 4 + j * 5;
+      size_t poff = offset + 6 + j * 5;   // header=6B
       s.points[j].x = rxBuffer[poff] | (rxBuffer[poff + 1] << 8);
       s.points[j].y = rxBuffer[poff + 2] | (rxBuffer[poff + 3] << 8);
       s.points[j].dt = rxBuffer[poff + 4];
     }
 
-    offset += 4 + s.pointCount * 5;
+    offset += 6 + s.pointCount * 5;  // header=6B
   }
 
   Serial.printf("Parsed: %d strokes from %d bytes\n", strokeCount, rxOffset);

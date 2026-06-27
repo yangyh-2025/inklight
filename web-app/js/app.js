@@ -12,6 +12,7 @@ let currentWeight = 2;
 let isEraser = false;
 let recordedStrokes = [];
 let isProjecting = false;
+let isReplaying = false;     // 回放时跳过录制
 let currentProjectId = null;
 
 // ---- DOM 引用 ----
@@ -27,6 +28,7 @@ const btnLibrary = document.getElementById('btn-library');
 const btnCloseLibrary = document.getElementById('btn-close-library');
 const btnClear = document.getElementById('btn-clear');
 const btnUndo = document.getElementById('btn-undo');
+const btnSave = document.getElementById('btn-save');
 const btnEraser = document.getElementById('btn-eraser');
 const weightSlider = document.getElementById('weight-slider');
 const weightLabel = document.getElementById('weight-label');
@@ -37,37 +39,40 @@ const projectionOverlay = document.getElementById('projection-overlay');
 const iosWarning = document.getElementById('ios-warning');
 const btnDismissIOS = document.getElementById('btn-dismiss-ios');
 
+// ---- 包裹 push 以便自动保存 ----
+function installAutoSavePatch(arr) {
+  const orig = arr.push.bind(arr);
+  arr.push = function (...args) {
+    const r = orig(...args);
+    scheduleAutoSave();
+    return r;
+  };
+}
+installAutoSavePatch(recordedStrokes);
+
 // ---- 初始化 ----
 function init() {
-  // iOS 检测
   if (BLE.isIOS()) {
-    // 检查是否已经忽略过
     if (!localStorage.getItem('inklight_ios_dismissed')) {
       iosWarning.classList.remove('hidden');
     }
   }
 
-  // 注册 Service Worker
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js');
   }
 
-  // 初始化 Atrament 手写画布
   initAtrament();
-
-  // 绑定事件
   bindEvents();
-
-  // 更新按钮状态
   updateProjectButton();
 }
 
 function initAtrament() {
-  // 让 canvas 填充容器
   function resizeCanvas() {
     const container = document.getElementById('canvas-container');
-    canvas.width = container.clientWidth * (window.devicePixelRatio || 1);
-    canvas.height = container.clientHeight * (window.devicePixelRatio || 1);
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = container.clientWidth * dpr;
+    canvas.height = container.clientHeight * dpr;
     canvas.style.width = container.clientWidth + 'px';
     canvas.style.height = container.clientHeight + 'px';
   }
@@ -81,23 +86,23 @@ function initAtrament() {
     adaptiveStroke: true,
   });
 
-  // 启用笔画录制
   atrament.recordStrokes = true;
 
-  // 监听笔画录制事件
+  // 笔画录制事件
   atrament.addEventListener('strokerecorded', ({ stroke }) => {
+    if (isReplaying) return;
     recordedStrokes.push({
       ...stroke,
-      color: currentColor,
-      weight: currentWeight,
+      color: atrament.color,          // 从实例读取, 不用全局变量
+      weight: atrament.weight,
       mode: isEraser ? 'erase' : 'draw',
+      stroke_index: recordedStrokes.length,
       timestamp: Date.now()
     });
-    emptyHint.style.display = recordedStrokes.length > 0 ? 'none' : '';
+    emptyHint.style.display = 'none';
     updateProjectButton();
   });
 
-  // 触摸开始隐藏提示
   canvas.addEventListener('touchstart', () => {
     emptyHint.style.display = 'none';
   }, { once: true });
@@ -114,13 +119,13 @@ function bindEvents() {
   btnClear.addEventListener('click', handleClear);
   btnUndo.addEventListener('click', handleUndo);
   btnEraser.addEventListener('click', toggleEraser);
+  btnSave.addEventListener('click', handleManualSave);
   weightSlider.addEventListener('input', handleWeightChange);
   btnDismissIOS.addEventListener('click', () => {
     iosWarning.classList.add('hidden');
     localStorage.setItem('inklight_ios_dismissed', '1');
   });
 
-  // 颜色选择
   document.querySelectorAll('.color-swatch').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.color-swatch').forEach(b => b.classList.remove('active'));
@@ -135,7 +140,6 @@ function bindEvents() {
     });
   });
 
-  // BLE 状态事件
   window.addEventListener('ble-disconnect', () => {
     updateConnectionUI('disconnected');
   });
@@ -204,7 +208,6 @@ async function handleProject() {
   try {
     await BLE.sendProjectionStart();
     await BLE.sendStrokes(recordedStrokes);
-    // ESP32 收到后自动开始投影，完成后 Notify 确认
   } catch (err) {
     alert('投影失败: ' + err.message);
   } finally {
@@ -217,9 +220,7 @@ async function handleProject() {
 async function handleStopProjection() {
   try {
     await BLE.sendProjectionStop();
-  } catch (err) {
-    // 忽略
-  }
+  } catch (err) { /* 忽略 */ }
   isProjecting = false;
   projectionOverlay.classList.add('hidden');
   updateProjectButton();
@@ -229,60 +230,57 @@ async function handleStopProjection() {
 function handleClear() {
   if (recordedStrokes.length === 0) return;
   if (!confirm('确定清空画布？此操作不可撤销。')) return;
-  atrament.clear();
   recordedStrokes = [];
+  installAutoSavePatch(recordedStrokes);
+  atrament.clear();
   emptyHint.style.display = '';
   updateProjectButton();
 }
 
 function handleUndo() {
-  // Atrament 5.x 的 undo 需要重新回放前面的笔画
   if (recordedStrokes.length <= 1) {
     handleClear();
     return;
   }
-  // 撤销最后一笔: 清空画布重播除最后一笔外的所有笔画
+  isReplaying = true;
   recordedStrokes.pop();
   atrament.clear();
-  replayStrokesToCanvas(recordedStrokes);
-  updateProjectButton();
-}
-
-function replayStrokesToCanvas(strokes) {
-  if (strokes.length === 0) {
-    emptyHint.style.display = '';
-    return;
+  for (const stroke of recordedStrokes) {
+    replayOneStroke(stroke);
   }
-  emptyHint.style.display = 'none';
-  for (const stroke of strokes) {
-    atrament.mode = stroke.mode || 'draw';
-    atrament.color = stroke.color;
-    atrament.weight = stroke.weight;
-    atrament.smoothing = stroke.smoothing || 0.85;
-
-    const segments = stroke.points || stroke.segments || [];
-    if (segments.length === 0) continue;
-
-    const first = segments[0];
-    const firstPoint = first.point || first;
-    atrament.beginStroke(firstPoint.x, firstPoint.y);
-
-    let prev = firstPoint;
-    for (let i = 1; i < segments.length; i++) {
-      const seg = segments[i];
-      const pt = seg.point || seg;
-      const pressure = seg.pressure ?? seg.p ?? 0.5;
-      const result = atrament.draw(pt.x, pt.y, prev.x, prev.y, pressure);
-      if (result) prev = { x: result.x, y: result.y };
-    }
-    const last = segments[segments.length - 1];
-    const lastPt = last.point || last;
-    atrament.endStroke(lastPt.x, lastPt.y);
-  }
-  // 恢复当前笔触设置
+  isReplaying = false;
+  // 恢复当前笔触
   atrament.mode = isEraser ? 'erase' : 'draw';
   atrament.color = currentColor;
   atrament.weight = currentWeight;
+  scheduleAutoSave();
+  updateProjectButton();
+}
+
+function replayOneStroke(stroke) {
+  atrament.mode = stroke.mode || 'draw';
+  atrament.color = stroke.color || currentColor;
+  atrament.weight = stroke.weight || currentWeight;
+  atrament.smoothing = stroke.smoothing || 0.85;
+
+  const segments = stroke.points || stroke.segments || [];
+  if (segments.length === 0) return;
+
+  const first = segments[0];
+  const firstPoint = first.point || first;
+  atrament.beginStroke(firstPoint.x, firstPoint.y);
+
+  let prev = firstPoint;
+  for (let i = 1; i < segments.length; i++) {
+    const seg = segments[i];
+    const pt = seg.point || seg;
+    const pressure = seg.pressure ?? seg.p ?? 0.5;
+    const result = atrament.draw(pt.x, pt.y, prev.x, prev.y, pressure);
+    if (result) prev = { x: result.x, y: result.y };
+  }
+  const last = segments[segments.length - 1];
+  const lastPt = last.point || last;
+  atrament.endStroke(lastPt.x, lastPt.y);
 }
 
 function toggleEraser() {
@@ -336,18 +334,16 @@ async function refreshLibrary() {
     thumbCanvas.height = 90;
     if (project.thumbnail) {
       const img = new Image();
+      img.onload = () => thumbCanvas.getContext('2d').drawImage(img, 0, 0, 160, 90);
       img.src = project.thumbnail;
-      img.onload = () => {
-        thumbCanvas.getContext('2d').drawImage(img, 0, 0, 160, 90);
-      };
     } else {
-      // 画占位背景
       const ctx = thumbCanvas.getContext('2d');
       ctx.fillStyle = '#fff';
       ctx.fillRect(0, 0, 160, 90);
-      ctx.fillStyle = '#ccc';
+      ctx.fillStyle = '#999';
       ctx.font = '12px sans-serif';
-      ctx.fillText('无预览', 50, 50);
+      ctx.textAlign = 'center';
+      ctx.fillText('无预览', 80, 50);
     }
 
     const meta = document.createElement('div');
@@ -358,7 +354,7 @@ async function refreshLibrary() {
     const actions = document.createElement('div');
     actions.className = 'actions';
     actions.innerHTML = `
-      <button class="load-btn">投影</button>
+      <button class="replay-btn">投影</button>
       <button class="edit-btn">加载</button>
       <button class="delete-btn danger">删除</button>
     `;
@@ -368,14 +364,10 @@ async function refreshLibrary() {
     card.appendChild(actions);
     libraryList.appendChild(card);
 
-    // 事件
-    card.querySelector('.load-btn').addEventListener('click', async () => {
+    card.querySelector('.replay-btn').addEventListener('click', async () => {
       closeLibrary();
       await loadProjectToCanvas(project.id);
-      // 加载后自动投影
-      if (BLE.getConnectionState()) {
-        await handleProject();
-      }
+      if (BLE.getConnectionState()) await handleProject();
     });
     card.querySelector('.edit-btn').addEventListener('click', async () => {
       closeLibrary();
@@ -384,10 +376,8 @@ async function refreshLibrary() {
     card.querySelector('.delete-btn').addEventListener('click', async () => {
       if (confirm('删除「' + name + '」？')) {
         await Storage.deleteProject(project.id);
+        if (currentProjectId === project.id) currentProjectId = null;
         await refreshLibrary();
-        if (currentProjectId === project.id) {
-          currentProjectId = null;
-        }
       }
     });
   }
@@ -396,16 +386,37 @@ async function refreshLibrary() {
 async function loadProjectToCanvas(projectId) {
   const strokes = await Storage.getProjectStrokes(projectId);
   if (strokes.length === 0) return;
+
   currentProjectId = projectId;
+  isReplaying = true;
   atrament.clear();
   recordedStrokes = [];
-  const convertedStrokes = strokes.map(s => ({
-    ...s,
-    segments: s.points?.map(p => ({ point: { x: p.x, y: p.y }, time: p.t, pressure: p.p || 0.5 }))
-  }));
-  replayStrokesToCanvas(convertedStrokes);
-  // 将重播的笔画加入录制列表
-  recordedStrokes = convertedStrokes;
+
+  // 转换 DB 格式 → 回放格式
+  for (const s of strokes) {
+    const segments = (s.points || []).map(p => ({
+      point: { x: p.x, y: p.y },
+      time: p.t_offset_ms ?? p.t ?? 0,
+      pressure: p.pressure ?? p.p ?? 0.5
+    }));
+    const stroke = {
+      ...s,
+      segments,
+      color: s.color || '#ff2020',
+      weight: s.weight || 2,
+      mode: s.mode || 'draw',
+      smoothing: s.smoothing || 0.85
+    };
+    recordedStrokes.push(stroke);
+    replayOneStroke(stroke);
+  }
+
+  isReplaying = false;
+  atrament.mode = isEraser ? 'erase' : 'draw';
+  atrament.color = currentColor;
+  atrament.weight = currentWeight;
+  installAutoSavePatch(recordedStrokes);
+  emptyHint.style.display = 'none';
   updateProjectButton();
 }
 
@@ -414,37 +425,46 @@ function updateProjectButton() {
   btnProject.disabled = !BLE.getConnectionState() || recordedStrokes.length === 0;
 }
 
-// 自动保存当前画布 (每 30 秒)
+// 自动保存 (每 30 秒节流)
 let autoSaveTimeout = null;
 function scheduleAutoSave() {
   clearTimeout(autoSaveTimeout);
-  autoSaveTimeout = setTimeout(async () => {
-    if (recordedStrokes.length === 0) return;
-    const name = '自动保存 ' + new Date().toLocaleString('zh-CN');
-    const project = {
-      id: currentProjectId || undefined,
-      name,
-      canvas_width: canvas.width,
-      canvas_height: canvas.height,
-      created_at: currentProjectId ? undefined : Date.now(),
-    };
-    try {
-      const savedId = await Storage.saveProject(project, recordedStrokes);
-      currentProjectId = savedId;
-      await Storage.pruneOldProjects();
-    } catch (e) {
-      console.warn('自动保存失败:', e);
-    }
-  }, 30000);
+  autoSaveTimeout = setTimeout(autoSave, 30000);
 }
 
-// 在每次笔画增加后触发
-const origPush = recordedStrokes.push.bind(recordedStrokes);
-recordedStrokes.push = function(...args) {
-  const result = origPush(...args);
-  scheduleAutoSave();
-  return result;
-};
+async function autoSave() {
+  if (recordedStrokes.length === 0) return;
+  const name = '自动保存 ' + new Date().toLocaleString('zh-CN');
+  const thumbCanvas = document.createElement('canvas');
+  thumbCanvas.width = 160;
+  thumbCanvas.height = 90;
+  const tctx = thumbCanvas.getContext('2d');
+  tctx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, 160, 90);
+
+  const project = {
+    id: currentProjectId || crypto.randomUUID(),
+    name: currentProjectId ? undefined : name,
+    canvas_width: canvas.width,
+    canvas_height: canvas.height,
+    created_at: currentProjectId ? undefined : Date.now(),
+    thumbnail: thumbCanvas.toDataURL('image/png', 0.5),
+  };
+  try {
+    const savedId = await Storage.saveProject(project, recordedStrokes);
+    if (!currentProjectId) currentProjectId = savedId;
+    await Storage.pruneOldProjects();
+  } catch (e) {
+    console.warn('自动保存失败:', e);
+  }
+}
+
+// ---- 手动保存 ----
+async function handleManualSave() {
+  if (recordedStrokes.length === 0) return;
+  clearTimeout(autoSaveTimeout);
+  await autoSave();
+  alert('已保存 ✓');
+}
 
 // ---- 启动 ----
 init();

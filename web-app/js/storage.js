@@ -19,99 +19,99 @@ function openDB() {
         d.createObjectStore(STORE_PROJECTS, { keyPath: 'id' });
       }
       if (!d.objectStoreNames.contains(STORE_STROKES)) {
-        const strokeStore = d.createObjectStore(STORE_STROKES, { keyPath: 'id' });
-        strokeStore.createIndex('project_id', 'project_id', { unique: false });
+        const ss = d.createObjectStore(STORE_STROKES, { keyPath: 'id' });
+        ss.createIndex('project_id', 'project_id', { unique: false });
       }
     };
-    req.onsuccess = (event) => {
-      db = event.target.result;
-      resolve(db);
-    };
-    req.onerror = (event) => {
-      reject(event.target.error);
-    };
+    req.onsuccess = (e) => { db = e.target.result; resolve(db); };
+    req.onerror = (e) => reject(e.target.error);
   });
 }
 
-// 保存作品
+// 保存/更新作品 (先删旧笔画再写新笔画)
 export async function saveProject(project, strokes) {
   const d = await openDB();
+  const id = project.id || generateId();
+  project.id = id;
+  project.updated_at = Date.now();
+  project.stroke_count = strokes.length;
+
   return new Promise((resolve, reject) => {
     const tx = d.transaction([STORE_PROJECTS, STORE_STROKES], 'readwrite');
-    const projectStore = tx.objectStore(STORE_PROJECTS);
-    const strokeStore = tx.objectStore(STORE_STROKES);
+    const pStore = tx.objectStore(STORE_PROJECTS);
+    const sStore = tx.objectStore(STORE_STROKES);
 
-    // 保存 project
-    project.updated_at = Date.now();
-    project.stroke_count = strokes.length;
-    project.id = project.id || generateId();
-    const pr = projectStore.put(project);
+    pStore.put(project);
 
-    // 删除旧笔画，写入新笔画
-    const strokeIds = strokes.map(s => s.id || generateId());
-    // 先清空该项目旧笔画 (简化: 直接写，旧数据会被覆盖或由 GC 清理)
-    // 实际: 我们仅写入新笔画，索引找旧的交给调用方清理
-    for (let i = 0; i < strokes.length; i++) {
-      const s = strokes[i];
-      s.id = strokeIds[i];
-      s.project_id = project.id;
-      strokeStore.put(s);
-    }
+    // 清理该项目的旧笔画 (通过索引)
+    const idx = sStore.index('project_id');
+    const keysReq = idx.getAllKeys(id);
+    keysReq.onsuccess = () => {
+      for (const key of keysReq.result) sStore.delete(key);
 
-    tx.oncomplete = () => resolve(project.id);
+      // 写入新笔画
+      for (const s of strokes) {
+        const stroke = { ...s };
+        stroke.id = stroke.id || generateId();
+        stroke.project_id = id;
+        // 规范化 point 数据: {x,y,t_offset_ms,pressure}
+        if (stroke.points || stroke.segments) {
+          const src = stroke.points || stroke.segments;
+          stroke.points = src.map(sp => {
+            const pt = sp.point || sp;
+            return {
+              x: pt.x ?? sp.x ?? 0,
+              y: pt.y ?? sp.y ?? 0,
+              t_offset_ms: pt.t ?? sp.time ?? sp.t ?? 0,
+              pressure: sp.pressure ?? sp.p ?? 0.5,
+            };
+          });
+          delete stroke.segments; // 统一用 points
+        }
+        sStore.put(stroke);
+      }
+    };
+
+    tx.oncomplete = () => resolve(id);
     tx.onerror = (e) => reject(e.target.error);
   });
 }
 
-// 获取所有作品列表 (不含笔画数据)
+// 列表 (不含笔画)
 export async function listProjects() {
   const d = await openDB();
   return new Promise((resolve, reject) => {
     const tx = d.transaction([STORE_PROJECTS], 'readonly');
-    const store = tx.objectStore(STORE_PROJECTS);
-    const req = store.getAll();
-    req.onsuccess = () => {
-      // 按创建时间倒序
-      const list = req.result.sort((a, b) => b.created_at - a.created_at);
-      resolve(list);
-    };
+    const req = tx.objectStore(STORE_PROJECTS).getAll();
+    req.onsuccess = () =>
+      resolve(req.result.sort((a, b) => b.created_at - a.created_at));
     req.onerror = (e) => reject(e.target.error);
   });
 }
 
-// 获取单个作品的完整笔画数据
+// 获取作品的笔画
 export async function getProjectStrokes(projectId) {
   const d = await openDB();
   return new Promise((resolve, reject) => {
     const tx = d.transaction([STORE_STROKES], 'readonly');
-    const store = tx.objectStore(STORE_STROKES);
-    const idx = store.index('project_id');
-    const req = idx.getAll(projectId);
-    req.onsuccess = () => {
-      // 按笔画序号排序
-      const strokes = req.result.sort((a, b) => a.stroke_index - b.stroke_index);
-      resolve(strokes);
-    };
+    const req = tx.objectStore(STORE_STROKES).index('project_id').getAll(projectId);
+    req.onsuccess = () =>
+      resolve(req.result.sort((a, b) => (a.stroke_index || 0) - (b.stroke_index || 0)));
     req.onerror = (e) => reject(e.target.error);
   });
 }
 
-// 删除作品及其笔画
+// 删除作品+笔画
 export async function deleteProject(projectId) {
   const d = await openDB();
   return new Promise((resolve, reject) => {
     const tx = d.transaction([STORE_PROJECTS, STORE_STROKES], 'readwrite');
-    const projectStore = tx.objectStore(STORE_PROJECTS);
-    const strokeStore = tx.objectStore(STORE_STROKES);
+    tx.objectStore(STORE_PROJECTS).delete(projectId);
 
-    projectStore.delete(projectId);
-
-    const idx = strokeStore.index('project_id');
+    const idx = tx.objectStore(STORE_STROKES).index('project_id');
     const req = idx.getAllKeys(projectId);
     req.onsuccess = () => {
-      for (const key of req.result) {
-        strokeStore.delete(key);
-      }
+      for (const k of req.result) tx.objectStore(STORE_STROKES).delete(k);
     };
 
     tx.oncomplete = () => resolve();
@@ -119,29 +119,16 @@ export async function deleteProject(projectId) {
   });
 }
 
-// 获取作品总数
-export async function getProjectCount() {
-  const d = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = d.transaction([STORE_PROJECTS], 'readonly');
-    const req = tx.objectStore(STORE_PROJECTS).count();
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = (e) => reject(e.target.error);
-  });
-}
-
-// 清理旧数据 (LRU，保留最近 50 条)
 export async function pruneOldProjects() {
-  const projects = await listProjects();
-  if (projects.length <= 50) return;
-  const toDelete = projects.slice(50);
-  for (const p of toDelete) {
+  const list = await listProjects();
+  if (list.length <= 50) return;
+  for (const p of list.slice(50)) {
     await deleteProject(p.id);
   }
 }
 
 function generateId() {
-  return crypto.randomUUID ? crypto.randomUUID() :
+  return crypto.randomUUID?.() ??
     'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
       const r = Math.random() * 16 | 0;
       return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
