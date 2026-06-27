@@ -1,0 +1,8 @@
+.omc/
+node_modules/
+.pio/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

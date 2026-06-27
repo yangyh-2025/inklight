@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#000000">
+  <title>InkLight - 墨迹投影</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <header id="toolbar">
+      <span class="logo">InkLight</span>
+      <div id="connection-status">
+        <span id="status-dot" class="dot disconnected"></span>
+        <span id="status-text">未连接</span>
+        <button id="btn-connect" class="btn-sm">连接设备</button>
+        <button id="btn-disconnect" class="btn-sm hidden">断开</button>
+      </div>
+    </header>
+
+    <main id="canvas-container">
+      <canvas id="drawing-canvas"></canvas>
+      <div id="empty-hint" class="hint">在这里写下你想投影的内容 ✍️</div>
+    </main>
+
+    <footer id="controls">
+      <div class="control-row">
+        <div class="color-picker" id="color-picker">
+          <button class="color-swatch active" data-color="#ff2020" style="background:#ff2020" title="红"></button>
+          <button class="color-swatch" data-color="#20ff20" style="background:#20ff20" title="绿"></button>
+          <button class="color-swatch" data-color="#ff2020,#20ff20" style="background:linear-gradient(135deg,#ff2020 50%,#20ff20 50%)" title="双色"></button>
+        </div>
+        <div class="weight-slider">
+          <input type="range" id="weight-slider" min="0.5" max="10" step="0.5" value="2">
+          <span id="weight-label">2mm</span>
+        </div>
+        <button id="btn-eraser" class="btn-sm tool-btn">🧹 橡皮</button>
+        <button id="btn-undo" class="btn-sm tool-btn">↩ 撤销</button>
+        <button id="btn-clear" class="btn-sm tool-btn">✕ 清空</button>
+      </div>
+      <div class="control-row main-actions">
+        <button id="btn-library" class="btn">📂 作品库</button>
+        <button id="btn-project" class="btn primary" disabled>▶ 投影</button>
+      </div>
+    </footer>
+
+    <!-- 作品库弹窗 -->
+    <div id="library-modal" class="modal hidden">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2>作品库</h2>
+          <button id="btn-close-library" class="btn-close">✕</button>
+        </div>
+        <div id="library-list" class="library-grid"></div>
+        <div id="library-empty" class="hint">还没有保存的作品</div>
+      </div>
+    </div>
+
+    <!-- 投影中遮罩 -->
+    <div id="projection-overlay" class="overlay hidden">
+      <div class="overlay-content">
+        <div class="projection-indicator">🔴 投影中...</div>
+        <button id="btn-stop-projection" class="btn danger">停止投影</button>
+      </div>
+    </div>
+
+    <!-- iOS 不兼容提示 -->
+    <div id="ios-warning" class="overlay hidden">
+      <div class="overlay-content">
+        <h2>🍏 iOS 用户请注意</h2>
+        <p>Safari 暂不支持蓝牙直连。请：</p>
+        <ol>
+          <li>安装 <strong>Bluefy</strong> 浏览器 (App Store 免费)</li>
+          <li>用 Bluefy 打开本页面</li>
+        </ol>
+        <p>或使用 Android 手机 + Chrome 打开。</p>
+        <button id="btn-dismiss-ios" class="btn">知道了</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Atrament.js 手写库 -->
+  <script src="https://cdn.jsdelivr.net/npm/atrament@5.1.0/dist/atrament.min.js"></script>
+  <script src="js/app.js" type="module"></script>
+</body>
+</html>

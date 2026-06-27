@@ -1,0 +1,14 @@
+{
+  "name": "InkLight - 墨迹投影",
+  "short_name": "InkLight",
+  "description": "打开浏览器写字，墙上的激光一笔一画还原出来",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#1a1a2e",
+  "theme_color": "#e94560",
+  "icons": [
+    { "src": "/img/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/img/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
